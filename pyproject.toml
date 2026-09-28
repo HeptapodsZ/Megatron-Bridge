@@ -23,6 +23,9 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["megatron.bridge", "megatron.bridge.*"]
 
+[tool.setuptools.package-data]
+"megatron.bridge.data.datasets" = ["glm5p2_chat_template.jinja"]
+
 [project]
 name = "megatron-bridge"
 description = "Megatron Bridge: Training Recipes for Megatron-based LLM and VLM models"

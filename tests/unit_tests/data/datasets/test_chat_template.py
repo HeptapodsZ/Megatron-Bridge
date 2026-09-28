@@ -782,11 +782,11 @@ class TestToolSchemasEdgeCases:
 
 
 class TestTruncationWithChatTemplates:
-    """Test cases for truncation behavior with chat templates."""
+    """Chat preprocessing preserves samples; collate rejects overlong inputs."""
 
     @patch("megatron.bridge.data.datasets.sft._JSONLMemMapDataset")
-    def test_truncation_happens_in_collate_fn(self, mock_dataset_class):
-        """Test that truncation happens in collate_fn, not _process_example."""
+    def test_preprocessing_preserves_overlong_sample(self, mock_dataset_class):
+        """Preprocessing preserves the full sequence for the later length check."""
         mock_dataset = MagicMock()
         mock_dataset.__len__.return_value = 10
         mock_dataset_class.return_value = mock_dataset
@@ -814,15 +814,14 @@ class TestTruncationWithChatTemplates:
         example = {"conversations": [{"from": "User", "value": "Test"}]}
         result = dataset._process_example(example)
 
-        # _process_example does NOT truncate - that happens in collate_fn
-        # Just verify it processed successfully
+        # Length validation happens in collate_fn; preprocessing keeps every token.
         assert "input_ids" in result
         assert "loss_mask" in result
         assert len(result["loss_mask"]) == len(result["input_ids"])
 
     @patch("megatron.bridge.data.datasets.sft._JSONLMemMapDataset")
-    def test_collate_fn_truncation_warning(self, mock_dataset_class):
-        """Test collate_fn handles truncation gracefully."""
+    def test_collate_fn_rejects_overlong_sample(self, mock_dataset_class):
+        """Overlong chat examples require a manual sequence-length adjustment."""
         mock_dataset = MagicMock()
         mock_dataset.__len__.return_value = 10
         mock_dataset_class.return_value = mock_dataset
@@ -852,15 +851,13 @@ class TestTruncationWithChatTemplates:
             }
         ]
 
-        # Should not crash, just truncate
-        result = dataset.collate_fn(batch)
-
-        # Verify truncation occurred
-        assert result["tokens"].shape[1] <= dataset.max_seq_length
+        with pytest.raises(ValueError, match="Manually increase dataset.seq_length and model.seq_length"):
+            dataset.collate_fn(batch)
+        assert len(batch[0]["input_ids"]) == 20
 
     @patch("megatron.bridge.data.datasets.sft._JSONLMemMapDataset")
-    def test_truncation_warns_when_loss_mask_empty(self, mock_dataset_class):
-        """Test that truncation warns and fixes when all assistant tokens are removed."""
+    def test_overflow_never_replaces_loss_mask(self, mock_dataset_class):
+        """Overlong samples retain their original mask when collation raises."""
 
         mock_dataset = MagicMock()
         mock_dataset.__len__.return_value = 10
@@ -892,17 +889,10 @@ class TestTruncationWithChatTemplates:
             }
         ]
 
-        # Capture log warnings
-        with patch("megatron.bridge.data.datasets.sft.logger") as mock_logger:
-            result = dataset.collate_fn(batch)
-
-            # Should have logged warning
-            mock_logger.warning.assert_called()
-            warning_msg = mock_logger.warning.call_args[0][0]
-            assert "no assistant tokens" in warning_msg.lower()
-
-            # Loss mask should be set to all ones as fallback
-            assert result["loss_mask"].sum().item() > 0
+        original_mask = batch[0]["loss_mask"].clone()
+        with pytest.raises(ValueError, match="Chat sample exceeds max_seq_length"):
+            dataset.collate_fn(batch)
+        assert torch.equal(batch[0]["loss_mask"], original_mask)
 
 
 class TestContextAnswerSplit:

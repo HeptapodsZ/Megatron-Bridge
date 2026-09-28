@@ -32,6 +32,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.tokenizers import MegatronTokenizer
 from torch.utils.data import Dataset
 
+from megatron.bridge.data.datasets.glm_chat import CHAT_MASK_STRATEGIES, GLM_MASK_STRATEGIES, preprocess_glm_chat
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.bridge.utils.safe_pickle import safe_pickle_load
 
@@ -879,7 +880,14 @@ def _convert_to_openai_messages(source: dict) -> list[dict]:
     return chat
 
 
-def _chat_preprocess(source: dict, tokenizer: MegatronTokenizer, tool_schemas: Optional[list[Any]] = None) -> dict:
+def _chat_preprocess(
+    source: dict,
+    tokenizer: MegatronTokenizer,
+    tool_schemas: Optional[list[Any]] = None,
+    *,
+    chat_template_mask_strategy: str = "template",
+    chat_template_kwargs: dict | None = None,
+) -> dict:
     """
     Preprocess messages to apply chat template and tokenize. Returns a dictionary of tokens.
 
@@ -915,6 +923,18 @@ def _chat_preprocess(source: dict, tokenizer: MegatronTokenizer, tool_schemas: O
     * answer_ids contain tokenized messages with chat template applied for only the assistant's last generated
     output
     """
+    if chat_template_mask_strategy not in CHAT_MASK_STRATEGIES:
+        raise ValueError(f"Unknown chat_template_mask_strategy: {chat_template_mask_strategy}")
+    if chat_template_mask_strategy in GLM_MASK_STRATEGIES:
+        return preprocess_glm_chat(
+            source,
+            tokenizer,
+            tool_schemas,
+            strategy=chat_template_mask_strategy,
+            template_kwargs=chat_template_kwargs,
+        )
+    if chat_template_kwargs:
+        raise ValueError("chat_template_kwargs currently requires an explicit GLM mask strategy")
     if not hasattr(tokenizer, "_tokenizer") or not hasattr(tokenizer._tokenizer, "apply_chat_template"):
         raise ValueError(
             "Cannot apply chat template with tokenizer that is not a HuggingFace AutoTokenizer. "

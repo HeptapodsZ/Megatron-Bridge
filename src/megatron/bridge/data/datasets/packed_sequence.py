@@ -80,6 +80,8 @@ def tokenize_dataset(
     Returns:
         np.ndarray: A NumPy array containing the tokenized data.
     """
+    if dataset_kwargs and dataset_kwargs.get("chat_template_mask_strategy") in {"glm_generation", "glm_role_tokens"}:
+        raise ValueError("GLM mask strategies do not yet support sequence packing; use unpacked JSONL")
     if not dataset_kwargs:
         dataset_kwargs = {}
 

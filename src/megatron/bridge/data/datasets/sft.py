@@ -27,6 +27,7 @@ from datasets import load_dataset
 from megatron.core.msc_utils import MultiStorageClientFeature
 from torch.utils.data import Dataset
 
+from megatron.bridge.data.datasets.glm_chat import CHAT_MASK_STRATEGIES, GLM_MASK_STRATEGIES
 from megatron.bridge.data.datasets.utils import (
     _chat_preprocess,
     _get_samples_mapping,
@@ -125,6 +126,8 @@ def create_sft_dataset(
     chat: bool = False,
     use_hf_tokenizer_chat_template: bool = False,
     tool_schemas: str | dict | None = None,
+    chat_template_mask_strategy: str = "template",
+    chat_template_kwargs: dict | None = None,
     **kwargs,
 ) -> "GPTSFTDataset":
     """
@@ -179,6 +182,9 @@ def create_sft_dataset(
         tool_schemas (str | dict | None, optional): Tool schemas for function calling support.
             Can be a JSON string or a dict. Only applies when `chat=True` and
             `use_hf_tokenizer_chat_template=True`. Defaults to None.
+        chat_template_mask_strategy: Assistant mask source: ``template``, ``glm_generation``,
+            or ``glm_role_tokens``. GLM strategies require unpacked HF chat data.
+        chat_template_kwargs: Thinking options for an explicit GLM mask strategy.
         **kwargs: Additional keyword arguments passed to the specific dataset class constructor.
 
     Returns:
@@ -186,6 +192,10 @@ def create_sft_dataset(
     """
     # Normalize path to string for consistent handling
     path_str = str(path)
+    if chat_template_mask_strategy not in CHAT_MASK_STRATEGIES:
+        raise ValueError(f"Unknown chat_template_mask_strategy: {chat_template_mask_strategy}")
+    if chat_template_mask_strategy in GLM_MASK_STRATEGIES and not (chat and use_hf_tokenizer_chat_template):
+        raise ValueError("GLM mask strategies require chat=True and use_hf_tokenizer_chat_template=True")
 
     gpt_sft_dataset_kwargs = {
         "file_path": path_str,
@@ -210,6 +220,8 @@ def create_sft_dataset(
 
     # Check for .npy packed dataset (legacy format)
     if path_str.lower().endswith(".npy"):
+        if chat_template_mask_strategy in GLM_MASK_STRATEGIES:
+            raise ValueError("GLM mask strategies do not yet support sequence packing; use unpacked JSONL")
         return GPTSFTPackedDataset(
             pack_metadata_file_path=pack_metadata_file_path,
             pad_cu_seqlens=pad_cu_seqlens,
@@ -231,6 +243,8 @@ def create_sft_dataset(
     # - Schema validation (REQUIRED_COLUMNS) will fast-fail if files aren't packed format
     # - This allows externally-prepared packed data to work without requiring MB metadata
     if is_packed_parquet_spec(path_str):
+        if chat_template_mask_strategy in GLM_MASK_STRATEGIES:
+            raise ValueError("GLM mask strategies do not yet support sequence packing; use unpacked JSONL")
         return GPTSFTPackedParquetDataset(
             pack_metadata_file_path=pack_metadata_file_path,
             pad_cu_seqlens=pad_cu_seqlens,
@@ -242,6 +256,8 @@ def create_sft_dataset(
             **gpt_sft_dataset_kwargs,
             use_hf_tokenizer_chat_template=use_hf_tokenizer_chat_template,
             tool_schemas=tool_schemas,
+            chat_template_mask_strategy=chat_template_mask_strategy,
+            chat_template_kwargs=chat_template_kwargs,
             **kwargs,
         )
     else:
@@ -1078,6 +1094,8 @@ class GPTSFTChatDataset(GPTSFTDataset):
         tokenizer: MegatronTokenizer,
         use_hf_tokenizer_chat_template: bool = False,
         tool_schemas: str | dict | None = None,
+        chat_template_mask_strategy: str = "template",
+        chat_template_kwargs: dict | None = None,
         **kwargs,
     ):
         """
@@ -1103,10 +1121,20 @@ class GPTSFTChatDataset(GPTSFTDataset):
             tokenizer: Tokenizer instance
             use_hf_tokenizer_chat_template: If True, use HuggingFace tokenizer's apply_chat_template
             tool_schemas: Tool schemas for function calling (JSON string or dict)
+            chat_template_mask_strategy: ``template``, ``glm_generation``, or ``glm_role_tokens``.
+            chat_template_kwargs: GLM thinking options shared by training and prompt rendering.
             **kwargs: Additional arguments passed to parent GPTSFTDataset
         """
         self.use_hf_tokenizer_chat_template = use_hf_tokenizer_chat_template
         self.tool_schemas = tool_schemas
+        if chat_template_mask_strategy not in CHAT_MASK_STRATEGIES:
+            raise ValueError(f"Unknown chat_template_mask_strategy: {chat_template_mask_strategy}")
+        if chat_template_mask_strategy in GLM_MASK_STRATEGIES and not use_hf_tokenizer_chat_template:
+            raise ValueError("GLM mask strategies require use_hf_tokenizer_chat_template=True")
+        if chat_template_kwargs is not None and not isinstance(chat_template_kwargs, dict):
+            raise ValueError("chat_template_kwargs must be a dictionary")
+        self.chat_template_mask_strategy = chat_template_mask_strategy
+        self.chat_template_kwargs = dict(chat_template_kwargs) if chat_template_kwargs is not None else None
 
         # Parse tool_schemas if it's a JSON string
         if isinstance(self.tool_schemas, str):
@@ -1152,8 +1180,7 @@ class GPTSFTChatDataset(GPTSFTDataset):
     def _process_example(self, example):
         """
         Create an example by concatenating text and answer.
-        Truncation is carried out when needed, but it is performed only on the prompt side.
-        BOS, EOS, and SEP, are added if specified.
+        Chat templates control special tokens. Overlong samples are rejected by collate_fn.
         """
         if not self.use_hf_tokenizer_chat_template:
             # Use legacy special token-based preprocessing
@@ -1167,7 +1194,16 @@ class GPTSFTChatDataset(GPTSFTDataset):
             )
         else:
             # Use HuggingFace chat template preprocessing
-            result = _chat_preprocess(example, self.tokenizer, self.tool_schemas)
+            try:
+                result = _chat_preprocess(
+                    example,
+                    self.tokenizer,
+                    self.tool_schemas,
+                    chat_template_mask_strategy=self.chat_template_mask_strategy,
+                    chat_template_kwargs=self.chat_template_kwargs,
+                )
+            except ValueError as exc:
+                raise ValueError(f"{self.file_path}: sample_uuid={example.get('uuid', 'unknown')}: {exc}") from exc
 
         # store metadata in dataset, in case user may have keys required in the prediction json files
         metadata = {k: v for k, v in example.items() if k not in ["conversations", "messages"]}
@@ -1179,6 +1215,25 @@ class GPTSFTChatDataset(GPTSFTDataset):
                     result["metadata"][key] = example[key]
 
         return result
+
+    def _validate_sample_length(self, item: dict, batch_index: int) -> None:
+        """Reject overlong examples before any batch tensors or padding are built."""
+        token_count = len(item["input_ids"])
+        context_length = len(item["context_ids"])
+        answer_length = len(item["answer_ids"])
+        required_length = max(token_count - 1, context_length + self.tokens_to_generate, answer_length)
+        sample_uuid = item.get("metadata", {}).get("uuid", "unknown")
+        location = f"{self.file_path}: batch_index={batch_index}, sample_uuid={sample_uuid}"
+        if required_length > self.max_seq_length:
+            raise ValueError(
+                f"Chat sample exceeds max_seq_length ({location}): token_count={token_count}, "
+                f"training_length={token_count - 1}, context_length={context_length}, "
+                f"tokens_to_generate={self.tokens_to_generate}, max_seq_length={self.max_seq_length}, "
+                f"required_length={required_length}. Manually increase dataset.seq_length and model.seq_length "
+                "together to at least required_length, respecting padding/parallelism constraints."
+            )
+        if len(item["loss_mask"]) != token_count or not torch.as_tensor(item["loss_mask"])[1:].any():
+            raise ValueError(f"Invalid chat loss_mask ({location}): expected aligned next-token supervision")
 
     def collate_fn(self, batch):
         """
@@ -1198,6 +1253,9 @@ class GPTSFTChatDataset(GPTSFTDataset):
             dict: A dictionary of batched tensors ready for model input. Key tensors include
                   'tokens', 'labels', 'loss_mask', 'position_ids', and 'attention_mask'.
         """
+        for index, item in enumerate(batch):
+            self._validate_sample_length(item, index)
+
         # Removes the last token from each input sequence to ensure the model
         # never sees the token it is supposed to predict. This enforces an
         # autoregressive training setup where the model learns to generate
@@ -1226,25 +1284,6 @@ class GPTSFTChatDataset(GPTSFTDataset):
         # purposes.
         metadata = [item["metadata"] for item in batch]
         max_length = max(max([len(x) for x in input_ids]), max([len(x) for x in contexts]) + self.tokens_to_generate)
-
-        if max_length > self.max_seq_length:
-            # truncate the sequences if it is longer than max_seq_length
-            input_ids = [x[: self.max_seq_length] for x in input_ids]
-            labels = [x[: self.max_seq_length] for x in labels]
-            loss_mask = [x[: self.max_seq_length] for x in loss_mask]
-
-            # Safety check: warn if truncation removed all trainable tokens
-            for i, x in enumerate(loss_mask):
-                x_tensor = torch.tensor(x)
-                if x_tensor.sum().item() == 0:
-                    logger.warning(
-                        "Due to truncation to max_seq_length, no assistant tokens are found in sample. "
-                        "Setting loss_mask to all ones."
-                    )
-                    loss_mask[i] = [1] * self.max_seq_length
-
-            contexts = [x[: self.max_seq_length] for x in contexts]
-            answers = [x[: self.max_seq_length] for x in answers]
 
         # increase max length to nearest multiple of 4 or 8
         if self.pad_to_max_length:
